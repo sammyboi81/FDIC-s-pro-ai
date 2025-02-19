@@ -1,4 +1,4 @@
 flask
 openai
 xmltodict
-gunicoirn
+gunicorn
