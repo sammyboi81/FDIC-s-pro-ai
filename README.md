@@ -1,1 +1,1 @@
-# Ftx-pro-ai
+# Fdx-pro-ai
