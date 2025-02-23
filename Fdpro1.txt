@@ -1,5 +1,0 @@
-flask
-openai
-xmltodict
-gunicorn
-git revert b9cd1748b512586134b34c5439524e99d1022dd7
