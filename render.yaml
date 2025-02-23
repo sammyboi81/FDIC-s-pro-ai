@@ -1,0 +1,14 @@
+# Exported from Render on 2025-02-23T08:12:35Z
+services:
+- type: web
+  name: Fdx-pro-ai
+  runtime: python
+  repo: https://github.com/sammyboi81/FDt-pro-ai
+  plan: free
+  envVars:
+  - key: openai_api_key
+    sync: false
+  region: oregon
+  buildCommand: pip install -r requirements.txt
+  startCommand: gunicoirn server:app
+version: "1"
