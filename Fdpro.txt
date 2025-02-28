@@ -1,38 +1,43 @@
-﻿from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file
 import openai
 import os
 import xml.etree.ElementTree as ET
 import re
-
+from io import BytesIO
 
 app = Flask(__name__)
 
-
-# OpenAI API Key (Set this in Render's environment variables)
+# OpenAI API Key from environment
 openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    raise ValueError("OPENAI_API_KEY not set in environment variables")
 
-
-# FDX Template file (You must upload this manually to Render)
-TEMPLATE_FDX_PATH = "Rezvani.fdx"
-
+# Basic FDX template (embedded to avoid file dependency)
+FDX_TEMPLATE = '''<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<FinalDraft DocumentType="Script" Template="No" Version="1">
+    <Content></Content>
+</FinalDraft>'''
 
 def generate_script(prompt):
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000
-    )
-    return response["choices"][0]["message"]["content"].strip()
-
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error calling OpenAI: {e}"
 
 def format_script(script_text):
     formatted_elements = []
     lines = script_text.split("\n")
 
-
     for i, line in enumerate(lines):
         line = line.strip()
-        if re.match(r'^(INT\.|EXT\.)\s', line):
+        if not line:
+            continue
+        if re.match(r'^(INT\.|EXT\.)\s', line, re.IGNORECASE):
             formatted_elements.append(("Scene Heading", line))
         elif i < len(lines) - 1 and re.match(r'^[A-Z ]+$', line) and len(line) < 20:
             formatted_elements.append(("Character", line))
@@ -40,53 +45,54 @@ def format_script(script_text):
             formatted_elements.append(("Dialogue", line))
         else:
             formatted_elements.append(("Action", line))
-    
     return formatted_elements
 
-
-def create_fdx(script_text, output_fdx_path="generated_script.fdx"):
+def create_fdx(script_text):
     try:
-        tree = ET.parse(TEMPLATE_FDX_PATH)
-        root = tree.getroot()
+        # Parse embedded template instead of file
+        root = ET.fromstring(FDX_TEMPLATE)
         content_section = root.find(".//Content")
-        if content_section is None:
-            raise ValueError("Error: No <Content> section found in FDX file.")
 
-
-        content_section.clear()
         formatted_script = format_script(script_text)
-
-
         for element_type, text in formatted_script:
-            paragraph = ET.Element("Paragraph")
-            paragraph.set("Type", element_type)
+            paragraph = ET.Element("Paragraph", Type=element_type)
             if element_type == "Character":
                 paragraph.set("Alignment", "Center")
             elif element_type == "Dialogue":
                 paragraph.set("Alignment", "Left")
-
-
             text_element = ET.SubElement(paragraph, "Text")
             text_element.text = text
             content_section.append(paragraph)
 
-
-        tree.write(output_fdx_path, encoding="utf-8", xml_declaration=True)
-        return output_fdx_path
-
-
+        # Return as string instead of writing to disk
+        return ET.tostring(root, encoding="utf-8", method="xml")
     except Exception as e:
-        return f"Error processing FDX file: {e}"
-
+        return f"Error processing FDX: {e}"
 
 @app.route("/generate_script", methods=["POST"])
 def generate_and_send_fdx():
     data = request.json
+    if not data or "prompt" not in data:
+        return jsonify({"error": "No prompt provided"}), 400
+    
     prompt = data.get("prompt", "Write a short script.")
     script_text = generate_script(prompt)
-    output_fdx = create_fdx(script_text, "generated_script.fdx")
-    return send_file(output_fdx, as_attachment=True)
-
+    
+    if isinstance(script_text, str) and script_text.startswith("Error"):
+        return jsonify({"error": script_text}), 500
+    
+    fdx_content = create_fdx(script_text)
+    if isinstance(fdx_content, str) and fdx_content.startswith("Error"):
+        return jsonify({"error": fdx_content}), 500
+    
+    # Send FDX as a file in memory
+    return send_file(
+        BytesIO(fdx_content),
+        as_attachment=True,
+        download_name="generated_script.fdx",
+        mimetype="application/xml"
+    )
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 10000))  # Use Render's PORT or default to 10000
+    app.run(host="0.0.0.0", port=port)
