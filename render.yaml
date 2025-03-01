@@ -1,14 +1,13 @@
-# Exported from Render on 2025-02-23T08:12:35Z
 services:
-- type: web
-  name: Fdx-pro-ai
-  runtime: python
-  repo: https://github.com/sammyboi81/FDt-pro-ai
-  plan: free
-  envVars:
-  - key: openai_api_key
-    sync: false
-  region: oregon
-  buildCommand: pip install -r requirements.txt
-  startCommand: gunicoirn server:app
-version: "1"
+  - type: web
+    name: fdt-pro-ai
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PORT
+        value: 8000
