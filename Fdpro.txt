@@ -1,98 +1,767 @@
-from flask import Flask, request, jsonify, send_file
-import openai
-import os
-import xml.etree.ElementTree as ET
-import re
-from io import BytesIO
+// File: package.json
+{
+  "name": "fdx-pro-ai",
+  "version": "1.0.0",
+  "description": "Convert screenplay treatments to Final Draft (FDX) format",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "screenplay",
+    "final draft",
+    "fdx",
+    "script",
+    "treatment",
+    "conversion"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsdom": "^21.1.1",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.6.0",
+    "xmlbuilder2": "^3.1.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
 
-app = Flask(__name__)
+// File: app.js
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { OpenAI } = require('openai');
+const xmlbuilder2 = require('xmlbuilder2');
 
-# OpenAI API Key from environment
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    raise ValueError("OPENAI_API_KEY not set in environment variables")
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-# Basic FDX template (embedded to avoid file dependency)
-FDX_TEMPLATE = '''<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
-<FinalDraft DocumentType="Script" Template="No" Version="1">
-    <Content></Content>
-</FinalDraft>'''
+// Configure OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-def generate_script(prompt):
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1000
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error calling OpenAI: {e}"
+// Configure middleware
+app.use(cors());
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-def format_script(script_text):
-    formatted_elements = []
-    lines = script_text.split("\n")
+// Set up file storage
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  }
+});
 
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-        if re.match(r'^(INT\.|EXT\.)\s', line, re.IGNORECASE):
-            formatted_elements.append(("Scene Heading", line))
-        elif i < len(lines) - 1 and re.match(r'^[A-Z ]+$', line) and len(line) < 20:
-            formatted_elements.append(("Character", line))
-        elif formatted_elements and formatted_elements[-1][0] == "Character":
-            formatted_elements.append(("Dialogue", line))
-        else:
-            formatted_elements.append(("Action", line))
-    return formatted_elements
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
-def create_fdx(script_text):
-    try:
-        # Parse embedded template instead of file
-        root = ET.fromstring(FDX_TEMPLATE)
-        content_section = root.find(".//Content")
+// Routes
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-        formatted_script = format_script(script_text)
-        for element_type, text in formatted_script:
-            paragraph = ET.Element("Paragraph", Type=element_type)
-            if element_type == "Character":
-                paragraph.set("Alignment", "Center")
-            elif element_type == "Dialogue":
-                paragraph.set("Alignment", "Left")
-            text_element = ET.SubElement(paragraph, "Text")
-            text_element.text = text
-            content_section.append(paragraph)
-
-        # Return as string instead of writing to disk
-        return ET.tostring(root, encoding="utf-8", method="xml")
-    except Exception as e:
-        return f"Error processing FDX: {e}"
-
-@app.route("/generate_script", methods=["POST"])
-def generate_and_send_fdx():
-    data = request.json
-    if not data or "prompt" not in data:
-        return jsonify({"error": "No prompt provided"}), 400
+app.post('/convert', upload.single('treatmentFile'), async (req, res) => {
+  try {
+    // Get treatment text (either from file or text input)
+    let treatmentText;
     
-    prompt = data.get("prompt", "Write a short script.")
-    script_text = generate_script(prompt)
-    
-    if isinstance(script_text, str) and script_text.startswith("Error"):
-        return jsonify({"error": script_text}), 500
-    
-    fdx_content = create_fdx(script_text)
-    if isinstance(fdx_content, str) and fdx_content.startswith("Error"):
-        return jsonify({"error": fdx_content}), 500
-    
-    # Send FDX as a file in memory
-    return send_file(
-        BytesIO(fdx_content),
-        as_attachment=True,
-        download_name="generated_script.fdx",
-        mimetype="application/xml"
-    )
+    if (req.file) {
+      // Read uploaded file
+      treatmentText = fs.readFileSync(req.file.path, 'utf8');
+    } else if (req.body.treatmentText) {
+      treatmentText = req.body.treatmentText;
+    } else {
+      return res.status(400).json({ error: 'No treatment provided' });
+    }
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))  # Use Render's PORT or default to 10000
-    app.run(host="0.0.0.0", port=port)
+    // Get additional parameters
+    const title = req.body.title || 'Untitled Screenplay';
+    const author = req.body.author || 'Anonymous';
+    
+    // Process with AI
+    const scriptData = await processWithAI(treatmentText, title, author);
+    
+    // Generate FDX file
+    const fdxContent = generateFDX(scriptData, title, author);
+    
+    // Create a unique filename for the script
+    const scriptFilename = `${title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_${Date.now()}.fdx`;
+    const scriptPath = path.join(__dirname, 'public', 'downloads', scriptFilename);
+    
+    // Ensure downloads directory exists
+    const downloadsDir = path.join(__dirname, 'public', 'downloads');
+    if (!fs.existsSync(downloadsDir)) {
+      fs.mkdirSync(downloadsDir, { recursive: true });
+    }
+    
+    // Write the FDX file
+    fs.writeFileSync(scriptPath, fdxContent);
+    
+    // Return success with download link
+    res.json({
+      success: true,
+      message: 'Treatment converted successfully',
+      downloadUrl: `/downloads/${scriptFilename}`,
+      scriptFilename
+    });
+    
+  } catch (error) {
+    console.error('Conversion error:', error);
+    res.status(500).json({ 
+      error: 'Error converting treatment', 
+      details: error.message 
+    });
+  }
+});
+
+app.get('/downloads/:filename', (req, res) => {
+  const filePath = path.join(__dirname, 'public', 'downloads', req.params.filename);
+  res.download(filePath);
+});
+
+// Process treatment with AI
+async function processWithAI(treatmentText, title, author) {
+  try {
+    const prompt = `
+      Convert the following screenplay treatment into a properly formatted screenplay.
+      Follow standard screenplay format with Scene Headings (INT/EXT), Action, Character Names, Dialogue, Parentheticals, and Transitions.
+      
+      Title: ${title}
+      Author: ${author}
+      
+      Treatment:
+      ${treatmentText}
+      
+      Format your response as JSON with the following structure:
+      {
+        "scenes": [
+          {
+            "heading": "INT/EXT. LOCATION - TIME",
+            "elements": [
+              {"type": "action", "content": "Action description"},
+              {"type": "character", "content": "CHARACTER NAME"},
+              {"type": "parenthetical", "content": "(beat)"},
+              {"type": "dialogue", "content": "Dialogue text"},
+              {"type": "transition", "content": "CUT TO:"}
+            ]
+          }
+        ]
+      }
+      
+      Be creative but maintain the story from the treatment. Expand into a full screenplay structure.
+    `;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        { role: "system", content: "You are a professional screenwriter specialized in converting treatments into properly formatted screenplays." },
+        { role: "user", content: prompt }
+      ],
+      response_format: { type: "json_object" }
+    });
+
+    // Parse the JSON response
+    const scriptData = JSON.parse(response.choices[0].message.content);
+    return scriptData;
+  } catch (error) {
+    console.error('AI processing error:', error);
+    throw new Error(`AI processing failed: ${error.message}`);
+  }
+}
+
+// Generate FDX XML
+function generateFDX(scriptData, title, author) {
+  try {
+    // Create FDX document structure
+    const doc = xmlbuilder2.create({ version: '1.0', encoding: 'UTF-8' });
+    
+    const fdx = doc.ele('FinalDraft', { DocumentType: 'Script', Template: 'Screenplay', Version: '3' });
+    
+    // Add content element
+    const content = fdx.ele('Content');
+    
+    // Add title page
+    const titlePage = content.ele('TitlePage');
+    titlePage.ele('Content').ele('Paragraph').ele('Text').txt(title);
+    titlePage.ele('Content').ele('Paragraph').ele('Text').txt('Written by');
+    titlePage.ele('Content').ele('Paragraph').ele('Text').txt(author);
+    
+    // Add scenes
+    scriptData.scenes.forEach(scene => {
+      // Add scene heading
+      content.ele('Paragraph', { Type: 'Scene Heading' })
+        .ele('Text').txt(scene.heading);
+      
+      // Add all elements in the scene
+      scene.elements.forEach(element => {
+        let type;
+        
+        switch (element.type.toLowerCase()) {
+          case 'action':
+            type = 'Action';
+            break;
+          case 'character':
+            type = 'Character';
+            break;
+          case 'dialogue':
+            type = 'Dialogue';
+            break;
+          case 'parenthetical':
+            type = 'Parenthetical';
+            break;
+          case 'transition':
+            type = 'Transition';
+            break;
+          default:
+            type = 'Action';
+        }
+        
+        content.ele('Paragraph', { Type: type })
+          .ele('Text').txt(element.content);
+      });
+    });
+    
+    // Convert to XML string
+    const xmlString = doc.end({ prettyPrint: true });
+    return xmlString;
+  } catch (error) {
+    console.error('FDX generation error:', error);
+    throw new Error(`Failed to generate FDX: ${error.message}`);
+  }
+}
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// File: public/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FDX Pro AI - Treatment to Final Draft Converter</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="styles.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+  <div class="container">
+    <header class="text-center my-5">
+      <h1>FDX Pro AI</h1>
+      <h2>Treatment to Final Draft Converter</h2>
+      <p class="lead">Transform your screenplay treatments into professionally formatted Final Draft (FDX) files</p>
+    </header>
+
+    <main>
+      <div class="card mb-4">
+        <div class="card-body">
+          <form id="conversionForm">
+            <div class="mb-3">
+              <label for="title" class="form-label">Screenplay Title</label>
+              <input type="text" class="form-control" id="title" name="title" placeholder="Enter screenplay title" required>
+            </div>
+
+            <div class="mb-3">
+              <label for="author" class="form-label">Author</label>
+              <input type="text" class="form-control" id="author" name="author" placeholder="Enter author name" required>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">Treatment Input Method</label>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="inputMethod" id="textInput" value="text" checked>
+                <label class="form-check-label" for="textInput">
+                  Enter Text
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="inputMethod" id="fileInput" value="file">
+                <label class="form-check-label" for="fileInput">
+                  Upload File
+                </label>
+              </div>
+            </div>
+
+            <div id="textInputSection" class="mb-3">
+              <label for="treatmentText" class="form-label">Enter Your Treatment</label>
+              <textarea class="form-control" id="treatmentText" name="treatmentText" rows="10" placeholder="Paste your screenplay treatment here..."></textarea>
+            </div>
+
+            <div id="fileInputSection" class="mb-3 d-none">
+              <label for="treatmentFile" class="form-label">Upload Treatment File</label>
+              <input type="file" class="form-control" id="treatmentFile" name="treatmentFile" accept=".txt,.docx,.pdf,.rtf">
+              <div class="form-text">Supported formats: .txt, .docx, .pdf, .rtf (Max 10MB)</div>
+            </div>
+
+            <div class="mb-4">
+              <button type="submit" class="btn btn-primary btn-lg w-100" id="convertBtn">
+                <span id="convertBtnText">Convert to Final Draft</span>
+                <span id="convertSpinner" class="spinner-border spinner-border-sm d-none" role="status" aria-hidden="true"></span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- Results Section -->
+      <div id="resultsSection" class="card mb-5 d-none">
+        <div class="card-header bg-success text-white">
+          <h3 class="m-0">Conversion Successful</h3>
+        </div>
+        <div class="card-body">
+          <div class="alert alert-success">
+            <i class="fas fa-check-circle me-2"></i> Your treatment has been successfully converted to Final Draft format!
+          </div>
+          
+          <div class="text-center my-4">
+            <a id="downloadLink" href="#" class="btn btn-success btn-lg">
+              <i class="fas fa-download me-2"></i> Download FDX File
+            </a>
+          </div>
+          
+          <div class="mt-4">
+            <h4>What to do next?</h4>
+            <ol class="list-group list-group-numbered mb-3">
+              <li class="list-group-item">Download your FDX file by clicking the button above</li>
+              <li class="list-group-item">Open the file in Final Draft software (or other compatible script editors)</li>
+              <li class="list-group-item">Review and refine your script as needed</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <!-- Error Section -->
+      <div id="errorSection" class="card mb-5 d-none">
+        <div class="card-header bg-danger text-white">
+          <h3 class="m-0">Conversion Error</h3>
+        </div>
+        <div class="card-body">
+          <div class="alert alert-danger">
+            <i class="fas fa-exclamation-triangle me-2"></i>
+            <span id="errorMessage">There was an error converting your treatment.</span>
+          </div>
+          
+          <div class="mt-4">
+            <h4>Troubleshooting Tips:</h4>
+            <ul class="list-group mb-3">
+              <li class="list-group-item">Check that your treatment follows standard narrative structure</li>
+              <li class="list-group-item">Try uploading a different file format</li>
+              <li class="list-group-item">Try a shorter treatment if your current one is very long</li>
+              <li class="list-group-item">Ensure your file doesn't contain complex formatting or special characters</li>
+            </ul>
+          </div>
+          
+          <div class="text-center mt-4">
+            <button type="button" class="btn btn-primary" id="tryAgainBtn">
+              <i class="fas fa-redo me-2"></i> Try Again
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- How It Works Section -->
+      <div class="card mb-5">
+        <div class="card-header">
+          <h3 class="m-0">How It Works</h3>
+        </div>
+        <div class="card-body">
+          <div class="row">
+            <div class="col-md-4 text-center mb-4 mb-md-0">
+              <div class="feature-icon">
+                <i class="fas fa-file-alt fa-3x text-primary mb-3"></i>
+              </div>
+              <h4>1. Enter Your Treatment</h4>
+              <p>Paste your screenplay treatment or upload a file containing your treatment text.</p>
+            </div>
+            
+            <div class="col-md-4 text-center mb-4 mb-md-0">
+              <div class="feature-icon">
+                <i class="fas fa-robot fa-3x text-primary mb-3"></i>
+              </div>
+              <h4>2. AI Processing</h4>
+              <p>Our AI analyzes your treatment and converts it into proper screenplay format with scenes and dialogue.</p>
+            </div>
+            
+            <div class="col-md-4 text-center">
+              <div class="feature-icon">
+                <i class="fas fa-download fa-3x text-primary mb-3"></i>
+              </div>
+              <h4>3. Download FDX File</h4>
+              <p>Get your professionally formatted script ready to open in Final Draft software.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAQ Section -->
+      <div class="card mb-5">
+        <div class="card-header">
+          <h3 class="m-0">Frequently Asked Questions</h3>
+        </div>
+        <div class="card-body">
+          <div class="accordion" id="faqAccordion">
+            <div class="accordion-item">
+              <h2 class="accordion-header" id="headingOne">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOne" aria-expanded="false" aria-controls="collapseOne">
+                  What is a treatment and how is it different from a screenplay?
+                </button>
+              </h2>
+              <div id="collapseOne" class="accordion-collapse collapse" aria-labelledby="headingOne" data-bs-parent="#faqAccordion">
+                <div class="accordion-body">
+                  A treatment is a prose narrative that outlines a screenplay. It's written in present tense and describes the story, characters, and major scenes without the formal formatting of a screenplay. A screenplay, on the other hand, follows a strict format with scene headings, action descriptions, character names, dialogue, and specific formatting rules.
+                </div>
+              </div>
+            </div>
+            
+            <div class="accordion-item">
+              <h2 class="accordion-header" id="headingTwo">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseTwo" aria-expanded="false" aria-controls="collapseTwo">
+                  Will I need to edit the script after conversion?
+                </button>
+              </h2>
+              <div id="collapseTwo" class="accordion-collapse collapse" aria-labelledby="headingTwo" data-bs-parent="#faqAccordion">
+                <div class="accordion-body">
+                  Yes, while our AI does a great job converting treatments to screenplay format, you should always review and refine the script afterward. The AI creates a solid first draft, but your creative vision and specific details may need adjustment. Think of this tool as a time-saving first step in your screenwriting process.
+                </div>
+              </div>
+            </div>
+            
+            <div class="accordion-item">
+              <h2 class="accordion-header" id="headingThree">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseThree" aria-expanded="false" aria-controls="collapseThree">
+                  What software can I use to open FDX files?
+                </button>
+              </h2>
+              <div id="collapseThree" class="accordion-collapse collapse" aria-labelledby="headingThree" data-bs-parent="#faqAccordion">
+                <div class="accordion-body">
+                  FDX files can be opened with Final Draft software, which is the industry standard for screenwriting. Alternative options include Highland, Writer Duet, Fade In, and Celtx, though some of these may have limited compatibility with certain FDX features.
+                </div>
+              </div>
+            </div>
+            
+            <div class="accordion-item">
+              <h2 class="accordion-header" id="headingFour">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseFour" aria-expanded="false" aria-controls="collapseFour">
+                  Is there a limit to how long my treatment can be?
+                </button>
+              </h2>
+              <div id="collapseFour" class="accordion-collapse collapse" aria-labelledby="headingFour" data-bs-parent="#faqAccordion">
+                <div class="accordion-body">
+                  For optimal results, we recommend treatments between 1-10 pages. Very long treatments may be truncated or processed in sections. The file upload limit is 10MB, but text-based treatments can be quite long before reaching this limit.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="text-center py-4">
+      <p>© 2023 FDX Pro AI. All rights reserved.</p>
+      <p><small>Not affiliated with Final Draft, Inc.</small></p>
+    </footer>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
+
+// File: public/styles.css
+body {
+  background-color: #f8f9fa;
+  color: #333;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.container {
+  max-width: 1000px;
+}
+
+header {
+  padding: 2rem 0;
+}
+
+h1 {
+  font-weight: 700;
+  color: #0d6efd;
+}
+
+.card {
+  border-radius: 10px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border: none;
+}
+
+.card-header {
+  border-radius: 10px 10px 0 0 !important;
+  font-weight: 600;
+}
+
+.feature-icon {
+  height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.accordion-button:not(.collapsed) {
+  background-color: #e7f1ff;
+  color: #0d6efd;
+}
+
+.accordion-button:focus {
+  box-shadow: none;
+  border-color: rgba(0, 0, 0, 0.125);
+}
+
+.form-control:focus {
+  border-color: #86b7fe;
+  box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+}
+
+.btn-primary {
+  background-color: #0d6efd;
+  border-color: #0d6efd;
+}
+
+.btn-primary:hover {
+  background-color: #0b5ed7;
+  border-color: #0a58ca;
+}
+
+.btn-success {
+  background-color: #198754;
+  border-color: #198754;
+}
+
+.btn-success:hover {
+  background-color: #157347;
+  border-color: #146c43;
+}
+
+textarea {
+  resize: vertical;
+}
+
+footer {
+  border-top: 1px solid #dee2e6;
+  margin-top: 2rem;
+  color: #6c757d;
+}
+
+// File: public/script.js
+document.addEventListener('DOMContentLoaded', function() {
+  // Get DOM elements
+  const conversionForm = document.getElementById('conversionForm');
+  const textInputMethod = document.getElementById('textInput');
+  const fileInputMethod = document.getElementById('fileInput');
+  const textInputSection = document.getElementById('textInputSection');
+  const fileInputSection = document.getElementById('fileInputSection');
+  const resultsSection = document.getElementById('resultsSection');
+  const errorSection = document.getElementById('errorSection');
+  const convertBtn = document.getElementById('convertBtn');
+  const convertBtnText = document.getElementById('convertBtnText');
+  const convertSpinner = document.getElementById('convertSpinner');
+  const downloadLink = document.getElementById('downloadLink');
+  const errorMessage = document.getElementById('errorMessage');
+  const tryAgainBtn = document.getElementById('tryAgainBtn');
+
+  // Toggle between text and file input methods
+  textInputMethod.addEventListener('change', toggleInputMethod);
+  fileInputMethod.addEventListener('change', toggleInputMethod);
+
+  function toggleInputMethod() {
+    if (textInputMethod.checked) {
+      textInputSection.classList.remove('d-none');
+      fileInputSection.classList.add('d-none');
+    } else {
+      textInputSection.classList.add('d-none');
+      fileInputSection.classList.remove('d-none');
+    }
+  }
+
+  // Handle form submission
+  conversionForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    // Show loading state
+    setLoading(true);
+    
+    // Hide any previous results or errors
+    resultsSection.classList.add('d-none');
+    errorSection.classList.add('d-none');
+    
+    // Get form data
+    const formData = new FormData(conversionForm);
+    
+    // Remove treatmentText if file input is selected
+    if (fileInputMethod.checked) {
+      formData.delete('treatmentText');
+    } else {
+      formData.delete('treatmentFile');
+    }
+    
+    // Send to server
+    fetch('/convert', {
+      method: 'POST',
+      body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+      setLoading(false);
+      
+      if (data.success) {
+        // Show success section
+        resultsSection.classList.remove('d-none');
+        
+        // Set download link
+        downloadLink.href = data.downloadUrl;
+        downloadLink.setAttribute('download', data.scriptFilename);
+        
+        // Scroll to results
+        resultsSection.scrollIntoView({ behavior: 'smooth' });
+      } else {
+        // Show error
+        showError(data.error || 'An unknown error occurred');
+      }
+    })
+    .catch(error => {
+      setLoading(false);
+      showError('Network error: ' + error.message);
+    });
+  });
+  
+  // Try again button
+  tryAgainBtn.addEventListener('click', function() {
+    errorSection.classList.add('d-none');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  
+  // Helper functions
+  function setLoading(isLoading) {
+    if (isLoading) {
+      convertBtn.disabled = true;
+      convertBtnText.textContent = 'Converting...';
+      convertSpinner.classList.remove('d-none');
+    } else {
+      convertBtn.disabled = false;
+      convertBtnText.textContent = 'Convert to Final Draft';
+      convertSpinner.classList.add('d-none');
+    }
+  }
+  
+  function showError(message) {
+    errorMessage.textContent = message;
+    errorSection.classList.remove('d-none');
+    errorSection.scrollIntoView({ behavior: 'smooth' });
+  }
+});
+
+// File: .env
+# Environment variables
+PORT=3000
+OPENAI_API_KEY=your_openai_api_key_here
+
+// File: .gitignore
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Generated files
+public/downloads/
+uploads/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Dependency directories
+.npm
+.eslintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# dotenv environment variable files
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# Render specific
+.render-buildpacks.json
+
+// File: Dockerfile
+FROM node:18-slim
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+RUN mkdir -p public/downloads uploads
+
+EXPOSE $PORT
+
+CMD ["npm", "start"]
+
+// File: render.yaml
+services:
+  - type: web
+    name: fdx-pro-ai
+    env: node
+    buildCommand: npm install
+    startCommand: node app.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: OPENAI_API_KEY
+        sync: false
+    disk:
+      name: data
+      mountPath: /app/public/downloads
+      sizeGB: 1
